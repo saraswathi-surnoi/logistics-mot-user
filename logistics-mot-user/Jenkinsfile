@@ -25,7 +25,7 @@ pipeline {
     /* 1️⃣ CHECKOUT */
     stage('Checkout') {
       steps {
-        git credentialsId: 'git-access', url: 'https://github.com/saraswathi-surnoi/logistics-backend.git'
+        git credentialsId: 'git-access', url: 'https://github.com/saraswathi-surnoi/logistics-mot-user.git'
       }
     }
 
