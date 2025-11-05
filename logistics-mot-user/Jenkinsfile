@@ -1,13 +1,237 @@
-@Library('jenkins-shared-library') _
+pipeline {
+  agent any
 
-def configMap = [
-    project : "logistics-mot", 
-    component: "user", 
-    repo: "SurnoiTechnology/logistics-mot-user", // DevOps-team will provide
-    agentLabel: "BACKEND-1" // DevOps-team will provide
-]
+  options {
+    timeout(time: 30, unit: 'MINUTES')
+    disableConcurrentBuilds()
+    timestamps()
+  }
 
-JavaCIPipeline(configMap)
+  parameters {
+    booleanParam(name: 'SKIP_QUALITY_CHECKS', defaultValue: false, description: 'Skip OWASP & Sonar quality stages')
+  }
 
-// for developing , update the code
-// develop
+  tools { maven 'maven-3.9.8' }
+
+  environment {
+    AWS_REGION     = "ap-south-1"
+    SONAR_PROJECT  = "logistics-mot-user"
+    SONAR_URL      = "https://sonarqube-logistics.surnoi.in:9000"
+    ECR_URI        = "361769585646.dkr.ecr.ap-south-1.amazonaws.com/logistics/logisticsmotuser"
+  }
+
+  stages {
+
+    /* 1️⃣ CHECKOUT */
+    stage('Checkout') {
+      steps {
+        git credentialsId: 'git-access', url: 'https://github.com/saraswathi-surnoi/logistics-backend.git'
+      }
+    }
+
+    /* 2️⃣ READ POM DETAILS */
+    stage('Read pom.xml') {
+      steps {
+        script {
+          echo "📘 Reading pom.xml for version & artifactId"
+          env.APP_VERSION    = sh(script: "mvn help:evaluate -Dexpression=project.version -q -DforceStdout", returnStdout: true).trim() ?: "0.0.1-SNAPSHOT"
+          env.DOCKER_IMAGE   = sh(script: "mvn help:evaluate -Dexpression=project.artifactId -q -DforceStdout", returnStdout: true).trim() ?: "logistics-api"
+          env.CONTAINER_NAME = env.DOCKER_IMAGE
+
+          echo "✅ Project: ${env.DOCKER_IMAGE}, Version: ${env.APP_VERSION}"
+
+          writeFile file: 'build_metadata.env', text: """APP_VERSION=${env.APP_VERSION}
+DOCKER_IMAGE=${env.DOCKER_IMAGE}
+CONTAINER_NAME=${env.CONTAINER_NAME}
+"""
+        }
+      }
+    }
+
+    /* 3️⃣ MAVEN BUILD */
+    stage('Build (Maven)') {
+      steps {
+        sh 'mvn clean package -DskipTests -B'
+      }
+      post {
+        success {
+          archiveArtifacts artifacts: 'target/*.jar', allowEmptyArchive: true
+        }
+      }
+    }
+
+    /* 4️⃣ QUALITY CHECKS */
+    stage('Quality Checks') {
+      when { expression { !params.SKIP_QUALITY_CHECKS } }
+      parallel {
+
+        stage('OWASP Dependency Scan') {
+          steps {
+            echo "🔒 Running OWASP dependency scan..."
+            sh 'mvn org.owasp:dependency-check-maven:check -Dformat=ALL -DoutputDirectory=target -B || true'
+          }
+          post {
+            always {
+              archiveArtifacts artifacts: 'target/dependency-check-report.*', allowEmptyArchive: true
+              publishHTML(target: [reportDir: 'target', reportFiles: 'dependency-check-report.html', reportName: 'OWASP Dependency Report'])
+            }
+          }
+        }
+
+        stage('SonarQube Analysis') {
+          environment { scannerHome = tool 'sonar-7.2' }
+          steps {
+            withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
+              withSonarQubeEnv('SonarQube-Server') {
+                sh """
+                  ${scannerHome}/bin/sonar-scanner \
+                    -Dsonar.projectKey=${SONAR_PROJECT} \
+                    -Dsonar.host.url=${SONAR_URL} \
+                    -Dsonar.login=${SONAR_TOKEN}
+                """
+              }
+            }
+          }
+        }
+      }
+    }
+
+    /* 5️⃣ SONAR QUALITY GATE */
+    stage('Quality Gate Check') {
+      when { expression { !params.SKIP_QUALITY_CHECKS } }
+      steps {
+        script {
+          echo "⏳ Waiting for SonarQube Quality Gate..."
+          def qg = waitForQualityGate abortPipeline: true
+          if (qg.status != 'OK') error "❌ Quality Gate failed: ${qg.status}"
+          echo "✅ Quality Gate passed."
+        }
+      }
+    }
+
+    /* 6️⃣ DOCKER BUILD */
+    stage('Build Docker Image') {
+      steps {
+        script {
+          def meta = readProperties(file: 'build_metadata.env')
+          echo "🐳 Building Docker image ${meta.DOCKER_IMAGE}:${meta.APP_VERSION}"
+          sh "docker build -t ${meta.DOCKER_IMAGE}:${meta.APP_VERSION} ."
+        }
+      }
+    }
+
+    /* 7️⃣ PUSH TO ECR */
+    stage('Push Image to ECR') {
+      steps {
+        script {
+          def meta = readProperties(file: 'build_metadata.env')
+          echo "📦 Pushing Docker image to ECR: ${ECR_URI}:${meta.APP_VERSION}"
+
+          withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-ecr-creds']]) {
+            sh """
+              aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_URI}
+              docker tag ${meta.DOCKER_IMAGE}:${meta.APP_VERSION} ${ECR_URI}:${meta.APP_VERSION}
+              docker tag ${meta.DOCKER_IMAGE}:${meta.APP_VERSION} ${ECR_URI}:latest
+              docker push ${ECR_URI}:${meta.APP_VERSION}
+              docker push ${ECR_URI}:latest
+              docker logout ${ECR_URI}
+            """
+          }
+        }
+      }
+    }
+
+    /* 8️⃣ ECR IMAGE SCAN */
+    stage('ECR Image Scan') {
+      steps {
+        script {
+          def meta = readProperties(file: 'build_metadata.env')
+          echo "🔍 Initiating ECR scan for ${meta.APP_VERSION}..."
+
+          sh """
+            aws ecr start-image-scan --repository-name logistics/backend \
+            --image-id imageTag=${meta.APP_VERSION} --region ${AWS_REGION} || true
+          """
+
+          timeout(time: 10, unit: 'MINUTES') {
+            waitUntil {
+              def status = sh(script: "aws ecr describe-image-scan-findings --repository-name logistics/backend --image-id imageTag=${meta.APP_VERSION} --region ${AWS_REGION} --query 'imageScanStatus.status' --output text || echo PENDING", returnStdout: true).trim()
+              echo "ECR Scan Status: ${status}"
+              return status == 'COMPLETE'
+            }
+          }
+
+          def critical = sh(script: "aws ecr describe-image-scan-findings --repository-name logistics/backend --image-id imageTag=${meta.APP_VERSION} --region ${AWS_REGION} --query 'imageScanFindings.findingSeverityCounts.CRITICAL' --output text || echo 0", returnStdout: true).trim()
+          echo "⚠️ Critical Vulnerabilities: ${critical}"
+        }
+      }
+    }
+  }
+
+  /* 🧾 POST BUILD SUMMARY & TEAMS NOTIFY */
+  post {
+    always {
+      echo "📦 Build Summary:"
+      echo "   Image: ${env.DOCKER_IMAGE}"
+      echo "   Version: ${env.APP_VERSION}"
+      echo "   Result: ${currentBuild.currentResult}"
+    }
+
+    success {
+      script {
+        echo "✅ Build successful. Sending Teams notification..."
+        def SONAR_LINK = "${SONAR_URL}/dashboard?id=${SONAR_PROJECT}"
+        def ECR_LINK = "https://${ECR_URI.replace('.dkr.ecr', '.console.aws.amazon.com/ecr/repositories')}/?region=${AWS_REGION}"
+
+        withCredentials([string(credentialsId: 'teams-webhook', variable: 'TEAMS_WEBHOOK')]) {
+          sh """
+            curl -s -H "Content-Type: application/json" -d '{
+              "@type": "MessageCard",
+              "@context": "https://schema.org/extensions",
+              "summary": "✅ SUCCESS: ${env.DOCKER_IMAGE} #${BUILD_NUMBER}",
+              "themeColor": "2EB886",
+              "title": "✅ Build Success - ${env.DOCKER_IMAGE}",
+              "sections": [{
+                "facts": [
+                  {"name": "Version", "value": "${env.APP_VERSION}"},
+                  {"name": "Result", "value": "${currentBuild.currentResult}"}
+                ]
+              }],
+              "potentialAction": [
+                {"@type": "OpenUri","name": "View Build","targets": [{"os": "default","uri": "${env.BUILD_URL}"}]},
+                {"@type": "OpenUri","name": "SonarQube","targets": [{"os": "default","uri": "${SONAR_LINK}"}]},
+                {"@type": "OpenUri","name": "ECR Repo","targets": [{"os": "default","uri": "${ECR_LINK}"}]}
+              ]
+            }' "$TEAMS_WEBHOOK"
+          """
+        }
+      }
+    }
+
+    failure {
+      script {
+        echo "❌ Build failed. Sending Teams alert..."
+        withCredentials([string(credentialsId: 'teams-webhook', variable: 'TEAMS_WEBHOOK')]) {
+          sh """
+            curl -s -H "Content-Type: application/json" -d '{
+              "@type": "MessageCard",
+              "@context": "https://schema.org/extensions",
+              "summary": "❌ FAILURE: ${env.DOCKER_IMAGE} #${BUILD_NUMBER}",
+              "themeColor": "E81123",
+              "title": "❌ Build Failed - ${env.DOCKER_IMAGE}",
+              "sections": [{
+                "facts": [
+                  {"name": "Version", "value": "${env.APP_VERSION}"},
+                  {"name": "Result", "value": "${currentBuild.currentResult}"}
+                ]
+              }],
+              "potentialAction": [
+                {"@type": "OpenUri","name": "View Build","targets": [{"os": "default","uri": "${env.BUILD_URL}"}]}
+              ]
+            }' "$TEAMS_WEBHOOK"
+          """
+        }
+      }
+    }
+  }
+}
